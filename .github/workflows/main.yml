@@ -27,7 +27,8 @@ jobs:
   env:
    GH_TOKEN: ${{ github.token }}
    RDP_USER: EVILSAAD
-   RDP_PASS: "itzdeep99"
+   RDP_PASS: ${{ secrets.RDP_PASS }}
+   TAILSCALE_AUTH_KEY: ${{ secrets.TAILSCALE_AUTH_KEY }}
    RESET_APPS: ${{ inputs.reset_apps }}
 
   steps:
@@ -746,39 +747,30 @@ jobs:
       } else { Write-Host "Saved wallpaper abhi nahi hai, skip" }
      } catch { Write-Host "Wallpaper restore fail: $_" }
      exit 0
-  - name: Install Tailscale and Restore Saved Login
+  - name: Install Tailscale (Fresh Runner State)
     run: |
-     $ErrorActionPreference = "Continue"
-     $installerPath = "$env:TEMP\tailscale.msi"
+     $ErrorActionPreference = "Stop"
+     $installerPath = "$env:TEMP\\tailscale.msi"
      $urls = @("https://pkgs.tailscale.com/stable/tailscale-setup-latest-arm64.msi", "https://pkgs.tailscale.com/stable/tailscale-setup-latest-amd64.msi")
      foreach ($u in $urls) {
       try { Invoke-WebRequest -Uri $u -OutFile $installerPath -ErrorAction Stop; if (Test-Path $installerPath) { break } }
       catch { Write-Host "Tailscale download fail ($u): $_" }
      }
-     if (-not (Test-Path $installerPath)) { Write-Error "Tailscale installer download nahi hua"; exit 1 }
+     if (-not (Test-Path $installerPath)) { throw "Tailscale installer download nahi hua" }
      Start-Process msiexec.exe -ArgumentList "/i", "`"$installerPath`"", "/quiet", "/norestart" -Wait
-     Remove-Item $installerPath -Force
+     Remove-Item $installerPath -Force -ErrorAction SilentlyContinue
+     # Purane runner ka server-state.conf dusre Windows SID se tied tha.
+     # Restore na karein; fresh service state generate hone dein.
+     Stop-Service -Name "Tailscale" -Force -ErrorAction SilentlyContinue
+     Start-Sleep -Seconds 2
+     Remove-Item "$env:ProgramData\\Tailscale\\server-state.conf" -Force -ErrorAction SilentlyContinue
+     Start-Service -Name "Tailscale" -ErrorAction Stop
      for ($i = 0; $i -lt 30; $i++) {
       $svc = Get-Service -Name "Tailscale" -ErrorAction SilentlyContinue
       if ($svc -and $svc.Status -eq "Running") { break }
       Start-Sleep -Seconds 2
      }
-     gh release download rdp-data --repo $env:GITHUB_REPOSITORY --pattern tailscale-state.tgz --dir $env:TEMP --clobber 2>$null
-     if (Test-Path "$env:TEMP\tailscale-state.tgz") {
-      Stop-Service -Name "Tailscale" -Force -ErrorAction SilentlyContinue
-      Start-Sleep -Seconds 3
-      New-Item -ItemType Directory -Force -Path "$env:ProgramData" | Out-Null
-      & "$env:SystemRoot\System32\tar.exe" -xzf "$env:TEMP\tailscale-state.tgz" -C "$env:ProgramData"
-      Start-Service -Name "Tailscale" -ErrorAction SilentlyContinue
-      for ($i = 0; $i -lt 30; $i++) {
-       $svc = Get-Service -Name "Tailscale" -ErrorAction SilentlyContinue
-       if ($svc -and $svc.Status -eq "Running") { break }
-       Start-Sleep -Seconds 2
-      }
-      Write-Host "Purana Tailscale login restore ho gaya."
-     } else {
-      Write-Host "Pehli baar hai, Tailscale login ek baar karna padega."
-     }
+     Write-Host "Tailscale fresh service state ready."
      exit 0
   - name: Install Extra Apps (apps.txt)
     continue-on-error: true
