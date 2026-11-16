@@ -747,6 +747,20 @@ jobs:
       } else { Write-Host "Saved wallpaper abhi nahi hai, skip" }
      } catch { Write-Host "Wallpaper restore fail: $_" }
      exit 0
+  - name: Set Display CPU Model (Cosmetic Only)
+    continue-on-error: true
+    run: |
+     $fakeCpu = 'Intel(R) Xeon(R) Platinum 8480+'
+     Write-Host "CPU model display label: $fakeCpu"
+     # Yeh sirf Windows display/registry label ko spoof karne ki best-effort koshish hai;
+     # physical CPU ya actual performance change nahi hoti.
+     try {
+      $keys = Get-ChildItem 'HKLM:\HARDWARE\DESCRIPTION\System\CentralProcessor' -ErrorAction Stop
+      foreach ($k in $keys) {
+       Set-ItemProperty -Path $k.PSPath -Name 'ProcessorNameString' -Value $fakeCpu -ErrorAction Stop
+      }
+      Write-Host 'CPU display label update attempt complete.'
+     } catch { Write-Host "CPU label registry update supported nahi hua: $_" }
   - name: Install Tailscale (Fresh Runner State)
     run: |
      $ErrorActionPreference = "Stop"
@@ -1081,62 +1095,69 @@ jobs:
      exit 0
   - name: Establish Tailscale Connection
     run: |
-     $ErrorActionPreference = "Continue"
-     $ts   = "$env:ProgramFiles\Tailscale\tailscale.exe"
-     $host_name = "akash-rdp"
-     function Get-TsIp {
-      try {
-       $st = (cmd /c "`"$ts`" status --json 2>nul") | Out-String | ConvertFrom-Json
-       if ($st.BackendState -eq "Running" -and $st.TailscaleIPs) {
-        return @($st.TailscaleIPs | Where-Object { $_ -match '^\d+\.\d+\.\d+\.\d+$' })[0]
-       }
-      } catch {}
-      return $null
+     $ErrorActionPreference = "Stop"
+     $ts = "$env:ProgramFiles\Tailscale\tailscale.exe"
+     if (-not (Test-Path $ts)) { throw "Tailscale CLI nahi mila: $ts" }
+     if ([string]::IsNullOrWhiteSpace($env:TAILSCALE_AUTH_KEY)) {
+      throw "TAILSCALE_AUTH_KEY secret missing hai. GitHub Settings > Secrets and variables > Actions mein valid Tailscale auth key add karein."
      }
-     $tsIP = $null
-     for ($i = 0; $i -lt 30 -and -not $tsIP; $i++) {
-      $tsIP = Get-TsIp
-      if (-not $tsIP) { Start-Sleep -Seconds 3 }
-     }
-     if ($tsIP) {
-      Write-Host "Saved Tailscale login se connect ho gaya. Same IP: $tsIP"
-     } else {
-      Write-Host "Saved login nahi chala, naya login link bana rahe hain..."
-      $out = "$env:TEMP\ts_out.txt"
-      $err = "$env:TEMP\ts_err.txt"
-      Remove-Item $out, $err -Force -ErrorAction SilentlyContinue
-      $p = Start-Process $ts -ArgumentList "up","--unattended","--reset","--hostname=$host_name" `
-      -RedirectStandardOutput $out -RedirectStandardError $err -NoNewWindow -PassThru
-      $link = $null
-      $text = ""
-      for ($i = 0; $i -lt 60 -and -not $link; $i++) {
+     # Windows Tailscale service server-mode mein hai; runneradmin ko local API access nahi.
+     # Isliye tailscale up/status ko SYSTEM scheduled task ke andar chalayein.
+     $taskName = "EVILSAAD-Tailscale-Connect"
+     $scriptPath = "C:\ts-connect-system.ps1"
+     $resultPath = "C:\ts-connect-result.txt"
+     $logPath = "C:\ts-connect-system.log"
+     Remove-Item $resultPath, $logPath -Force -ErrorAction SilentlyContinue
+     $key = $env:TAILSCALE_AUTH_KEY.Replace("'", "''")
+     $taskScript = @"
+     `$ErrorActionPreference = 'Stop'
+     `$ts = '$ts'
+     try {
+      & `$ts up "--auth-key=$key" '--hostname=akash-rdp' '--unattended' '--reset' *> '$logPath'
+      if (`$LASTEXITCODE -ne 0) { throw "tailscale up exit code: `$LASTEXITCODE" }
+      for (`$i = 0; `$i -lt 60; `$i++) {
+       `$jsonText = & `$ts status --json 2>&1 | Out-String
+       try {
+        `$st = `$jsonText | ConvertFrom-Json
+        `$ip = @(`$st.TailscaleIPs | Where-Object { `$_ -match '^\d+\.\d+\.\d+\.\d+$' })[0]
+        if (`$st.BackendState -eq 'Running' -and `$ip) {
+         Set-Content -Path '$resultPath' -Value `$ip -NoNewline
+         exit 0
+        }
+       } catch {}
        Start-Sleep -Seconds 2
-       $text = "$(Get-Content $out -Raw -ErrorAction SilentlyContinue)`n$(Get-Content $err -Raw -ErrorAction SilentlyContinue)"
-       if ($text -match 'https://login\.tailscale\.com/\S+') { $link = $Matches[0] }
-       elseif ($p.HasExited) { break }
       }
-      if (-not $link) {
-       $tsIP = Get-TsIp
-       if (-not $tsIP) {
-        Write-Host "---- tailscale output ----"
-        Write-Host $text
-        exit 1
-       }
-      } else {
-       Write-Host "`n=============================="
-       Write-Host " TAILSCALE LOGIN LINK (isse kholo):"
-       Write-Host " $link"
-       Write-Host "==============================`n"
-       for ($i = 0; $i -lt 120 -and -not $tsIP; $i++) {
-        Start-Sleep -Seconds 5
-        $tsIP = Get-TsIp
-       }
+      throw 'Tailscale IP 120 seconds mein nahi mila.'
+     } catch {
+      Add-Content -Path '$logPath' -Value `$_
+      Set-Content -Path '$resultPath' -Value 'ERROR'
+      exit 1
+     }
+     "@
+     Set-Content -Path $scriptPath -Value $taskScript -Encoding UTF8
+     $runAt = (Get-Date).AddMinutes(1).ToString('HH:mm')
+     schtasks.exe /Create /TN $taskName /SC ONCE /ST $runAt /RU SYSTEM /RL HIGHEST /TR "powershell.exe -NoProfile -ExecutionPolicy Bypass -File `"$scriptPath`"" /F | Out-Null
+     if ($LASTEXITCODE -ne 0) { throw "SYSTEM scheduled task create nahi hua (exit $LASTEXITCODE)" }
+     schtasks.exe /Run /TN $taskName | Out-Null
+     if ($LASTEXITCODE -ne 0) { throw "SYSTEM scheduled task start nahi hua (exit $LASTEXITCODE)" }
+     $tsIP = $null
+     for ($i = 0; $i -lt 150; $i++) {
+      Start-Sleep -Seconds 2
+      if (Test-Path $resultPath) {
+       $result = (Get-Content $resultPath -Raw).Trim()
+       if ($result -match '^100\.\d+\.\d+\.\d+$') { $tsIP = $result; break }
+       if ($result -eq 'ERROR') { break }
       }
-      if (-not $tsIP) { Write-Host "Login nahi hua, Tailscale IP nahi mila"; exit 1 }
+     }
+     if (-not $tsIP) {
+      Write-Host '---- Tailscale SYSTEM task log ----'
+      if (Test-Path $logPath) { Get-Content $logPath -ErrorAction SilentlyContinue | Write-Host }
+      throw 'Tailscale connect fail. Auth key valid hai aur device authorization allowed hai, check karein.'
      }
      "TAILSCALE_IP=$tsIP" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
-     Start-Sleep -Seconds 2
-     if (Test-Path "C:\save-ts.ps1") { & "C:\save-ts.ps1" }
+     Write-Host "Tailscale connected: $tsIP"
+     schtasks.exe /Delete /TN $taskName /F | Out-Null
+     Remove-Item $scriptPath, $resultPath -Force -ErrorAction SilentlyContinue
      exit 0
   - name: Start Self-Heal Watchdog (background)
     continue-on-error: true
@@ -1261,7 +1282,7 @@ jobs:
      Write-Host "`n=== RDP ACCESS ==="
      Write-Host "Address: $env:TAILSCALE_IP"
      Write-Host "Username: $env:RDP_USER"
-     Write-Host "Password: $env:RDP_PASS"
+     Write-Host "Password: GitHub Secret RDP_PASS se set hai (log mein hide kiya gaya)."
      Write-Host "==================`n"
      # save ka kaam (tar/compress) background me halka chale, RDP slow na ho
      try { (Get-Process -Id $PID).PriorityClass = "BelowNormal" } catch {}
