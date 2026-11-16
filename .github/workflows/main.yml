@@ -28,7 +28,7 @@ jobs:
    GH_TOKEN: ${{ github.token }}
    RDP_USER: EVILSAAD
    RDP_PASS: ${{ secrets.RDP_PASS }}
-   TAILSCALE_AUTH_KEY: ${{ secrets.TAILSCALE_AUTH_KEY }}
+   TAILSCALE_AUTHKEY: ${{ secrets.TAILSCALE_AUTHKEY }}
    RESET_APPS: ${{ inputs.reset_apps }}
 
   steps:
@@ -747,20 +747,6 @@ jobs:
       } else { Write-Host "Saved wallpaper abhi nahi hai, skip" }
      } catch { Write-Host "Wallpaper restore fail: $_" }
      exit 0
-  - name: Set Display CPU Model (Cosmetic Only)
-    continue-on-error: true
-    run: |
-     $fakeCpu = 'Intel(R) Xeon(R) Platinum 8480+'
-     Write-Host "CPU model display label: $fakeCpu"
-     # Yeh sirf Windows display/registry label ko spoof karne ki best-effort koshish hai;
-     # physical CPU ya actual performance change nahi hoti.
-     try {
-      $keys = Get-ChildItem 'HKLM:\HARDWARE\DESCRIPTION\System\CentralProcessor' -ErrorAction Stop
-      foreach ($k in $keys) {
-       Set-ItemProperty -Path $k.PSPath -Name 'ProcessorNameString' -Value $fakeCpu -ErrorAction Stop
-      }
-      Write-Host 'CPU display label update attempt complete.'
-     } catch { Write-Host "CPU label registry update supported nahi hua: $_" }
   - name: Install Tailscale (Fresh Runner State)
     run: |
      $ErrorActionPreference = "Stop"
@@ -786,6 +772,10 @@ jobs:
      }
      Write-Host "Tailscale fresh service state ready."
      exit 0
+  - name: Connect Tailscale
+    uses: tailscale/github-action@v4
+    with:
+     authkey: ${{ secrets.TAILSCALE_AUTHKEY }}
   - name: Install Extra Apps (apps.txt)
     continue-on-error: true
     run: |
@@ -1097,67 +1087,26 @@ jobs:
     run: |
      $ErrorActionPreference = "Stop"
      $ts = "$env:ProgramFiles\Tailscale\tailscale.exe"
-     if (-not (Test-Path $ts)) { throw "Tailscale CLI nahi mila: $ts" }
-     if ([string]::IsNullOrWhiteSpace($env:TAILSCALE_AUTH_KEY)) {
-      throw "TAILSCALE_AUTH_KEY secret missing hai. GitHub Settings > Secrets and variables > Actions mein valid Tailscale auth key add karein."
+     function Get-TsIp {
+      try {
+       $st = (& $ts status --json 2>$null | Out-String) | ConvertFrom-Json
+       if ($st.BackendState -eq "Running" -and $st.TailscaleIPs) {
+        return @($st.TailscaleIPs | Where-Object { $_ -match '^\d+\.\d+\.\d+\.\d+$' })[0]
+       }
+      } catch {}
+      return $null
      }
-     # Windows Tailscale service server-mode mein hai; runneradmin ko local API access nahi.
-     # Isliye tailscale up/status ko SYSTEM scheduled task ke andar chalayein.
-     $taskName = "EVILSAAD-Tailscale-Connect"
-     $scriptPath = "C:\ts-connect-system.ps1"
-     $resultPath = "C:\ts-connect-result.txt"
-     $logPath = "C:\ts-connect-system.log"
-     Remove-Item $resultPath, $logPath -Force -ErrorAction SilentlyContinue
-     $key = $env:TAILSCALE_AUTH_KEY.Replace("'", "''")
-     $taskScript = @"
-     `$ErrorActionPreference = 'Stop'
-     `$ts = '$ts'
-     try {
-      & `$ts up "--auth-key=$key" '--hostname=akash-rdp' '--unattended' '--reset' *> '$logPath'
-      if (`$LASTEXITCODE -ne 0) { throw "tailscale up exit code: `$LASTEXITCODE" }
-      for (`$i = 0; `$i -lt 60; `$i++) {
-       `$jsonText = & `$ts status --json 2>&1 | Out-String
-       try {
-        `$st = `$jsonText | ConvertFrom-Json
-        `$ip = @(`$st.TailscaleIPs | Where-Object { `$_ -match '^\d+\.\d+\.\d+\.\d+$' })[0]
-        if (`$st.BackendState -eq 'Running' -and `$ip) {
-         Set-Content -Path '$resultPath' -Value `$ip -NoNewline
-         exit 0
-        }
-       } catch {}
-       Start-Sleep -Seconds 2
-      }
-      throw 'Tailscale IP 120 seconds mein nahi mila.'
-     } catch {
-      Add-Content -Path '$logPath' -Value `$_
-      Set-Content -Path '$resultPath' -Value 'ERROR'
-      exit 1
-     }
-     "@
-     Set-Content -Path $scriptPath -Value $taskScript -Encoding UTF8
-     $runAt = (Get-Date).AddMinutes(1).ToString('HH:mm')
-     schtasks.exe /Create /TN $taskName /SC ONCE /ST $runAt /RU SYSTEM /RL HIGHEST /TR "powershell.exe -NoProfile -ExecutionPolicy Bypass -File `"$scriptPath`"" /F | Out-Null
-     if ($LASTEXITCODE -ne 0) { throw "SYSTEM scheduled task create nahi hua (exit $LASTEXITCODE)" }
-     schtasks.exe /Run /TN $taskName | Out-Null
-     if ($LASTEXITCODE -ne 0) { throw "SYSTEM scheduled task start nahi hua (exit $LASTEXITCODE)" }
      $tsIP = $null
-     for ($i = 0; $i -lt 150; $i++) {
-      Start-Sleep -Seconds 2
-      if (Test-Path $resultPath) {
-       $result = (Get-Content $resultPath -Raw).Trim()
-       if ($result -match '^100\.\d+\.\d+\.\d+$') { $tsIP = $result; break }
-       if ($result -eq 'ERROR') { break }
-      }
+     for ($i = 0; $i -lt 30 -and -not $tsIP; $i++) {
+      $tsIP = Get-TsIp
+      if (-not $tsIP) { Start-Sleep -Seconds 3 }
      }
      if (-not $tsIP) {
-      Write-Host '---- Tailscale SYSTEM task log ----'
-      if (Test-Path $logPath) { Get-Content $logPath -ErrorAction SilentlyContinue | Write-Host }
-      throw 'Tailscale connect fail. Auth key valid hai aur device authorization allowed hai, check karein.'
+      & $ts status
+      throw "Tailscale authenticate nahi hua ya Tailscale IP nahi mila. GitHub secret TAILSCALE_AUTHKEY check karo."
      }
      "TAILSCALE_IP=$tsIP" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
-     Write-Host "Tailscale connected: $tsIP"
-     schtasks.exe /Delete /TN $taskName /F | Out-Null
-     Remove-Item $scriptPath, $resultPath -Force -ErrorAction SilentlyContinue
+     Write-Host "Tailscale connected. IP: $tsIP"
      exit 0
   - name: Start Self-Heal Watchdog (background)
     continue-on-error: true
@@ -1282,7 +1231,7 @@ jobs:
      Write-Host "`n=== RDP ACCESS ==="
      Write-Host "Address: $env:TAILSCALE_IP"
      Write-Host "Username: $env:RDP_USER"
-     Write-Host "Password: GitHub Secret RDP_PASS se set hai (log mein hide kiya gaya)."
+     Write-Host "Password: $env:RDP_PASS"
      Write-Host "==================`n"
      # save ka kaam (tar/compress) background me halka chale, RDP slow na ho
      try { (Get-Process -Id $PID).PriorityClass = "BelowNormal" } catch {}
